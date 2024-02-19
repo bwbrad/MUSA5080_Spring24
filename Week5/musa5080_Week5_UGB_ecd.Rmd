@@ -37,6 +37,8 @@ library(kableExtra)
 library(rmarkdown)
 library(RColorBrewer)
 library(classInt)
+library(tmap)
+library(ggspatial)
 ```
 
 
@@ -77,7 +79,6 @@ ggplot()+
 
 Now let's get some census data to work a bit more on maps
 
-
 ```{r getcensus}
 tracts17 <- 
   get_acs(geography = "tract", variables = c("B25026_001E","B25058_001E"), 
@@ -87,20 +88,39 @@ tracts17 <-
          MedRent = B25058_001E) %>%
   dplyr::select(-NAME, -starts_with("B")) %>%
   mutate(area_sqFt = (as.numeric(st_area(.))))
+
+counties <- get_acs(geography = "county",
+                    state = "PA",
+                    county = "Lancaster",
+                    variables = "B25026_001",
+                    geometry = TRUE)
 ```
 
 As a warm-up, calculate the population density of each tract. We will then try to make a slightly better choropleth map than the one we did previously.
 The code below just uses population as an example. It is a ggplot map that contains discrete groups - broken into quantiles
 
+```{r}
+tracts17 <- tracts17 %>%
+  mutate(area_sqMi = area_sqFt / 27878400) %>% 
+  mutate(pop_dens = TotalPop / area_sqMi)
+
+ggplot() +
+  geom_sf(data = tracts17, aes(fill = pop_dens)) +
+  scale_fill_distiller(name = "Population Density", palette = "Purples", 
+                       direction = 1, labels=scales::comma_format()) +
+  theme_void()
+```
 
 ```{r improvedmap}
+?scale_fill_distiller
+
  # Assuming tracts17 and uga are loaded and properly formatted spatial dataframes
 
 # Calculate quantiles for class breaks
 breaks_quantiles <- classIntervals(tracts17$TotalPop, n = 5, style = "quantile")
 
 # Define colors using ColorBrewer palette - matching the number of breaks
-colors <- brewer.pal(n = 5, name = "YlGnBu")
+colors <- brewer.pal(n = 5, name = "PuBu")
 
 # Generate custom labels showing the range of each class
 labels <- paste0(formatC(breaks_quantiles$brks[-length(breaks_quantiles$brks)], format = "f", digits = 1, big.mark = ","), 
@@ -109,19 +129,47 @@ labels <- paste0(formatC(breaks_quantiles$brks[-length(breaks_quantiles$brks)], 
 
 # Create improved map with custom range labels for legend
 map_improved <- ggplot() +
-  geom_sf(data = tracts17, aes(fill = cut(TotalPop, breaks = breaks_quantiles$brks, include.lowest = TRUE)), color = "lightgrey") +
-  scale_fill_manual(values = colors,
-                     name = "Population",
-                     labels = labels) +  # Use custom range labels
-  geom_sf(data = uga, fill = NA, color = "white", linetype = 1, lwd = 0.5) +  # Use NA for fill to make the boundaries transparent
-  labs(title = "Population of Census Tracts in Lancaster County") +
-  theme_void()
+  geom_sf(data = tracts17,
+          aes(fill = cut(TotalPop,
+                         breaks = breaks_quantiles$brks,
+                         include.lowest = TRUE)),
+          color = NA) +
+  scale_fill_brewer(type = "seq",
+                    palette = "PuBu",
+                    direction = -1,
+                    name = "Population Density",
+                    labels = labels) +  # Use custom range labels
+    geom_sf(data = uga, 
+          fill = NA, 
+          color = "#d9232a40", 
+          lwd = 1.5) +
+    geom_sf(data = uga, 
+          fill = NA, 
+          color = "white",
+          alpha = 0.1,
+          linetype = "twodash", 
+          lwd = 0.25) +
+    geom_sf(data = counties,
+          fill = NA,
+          color = "#969696",
+          lty = "twodash") +
+  coord_sf(crs = st_crs(4269)) +# Use NA for fill to make the boundaries transparent
+  labs(title = "Population Density of Census Tracts in Lancaster County") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = "#f7f7f7"),
+        panel.border = element_rect(color = "#969696", fill = NA, linewidth = 1),
+        plot.margin = margin(2, 2, 2, 24),
+        plot.caption = element_text(hjust = 0),
+        plot.title = element_text(face = "bold", margin = margin(b = 8))) +
+  annotation_scale(location = "bl",
+                   unit_category = "imperial")
 
 # Display the map
 map_improved
 
+?annotation_north_arrow
 
-
+?scale_fill_brewer
 ```
 
 Here is the tmap version. I think its a bit more straightforward to create a nice looking map.
@@ -150,8 +198,14 @@ See the code below. Change to population density. Experiment with the settings. 
 
 ```{r tmapversion}
 map_improved <- tm_shape(tracts17) +
-  tm_polygons(fill = "TotalPop", style = "quantile", border.col = NA, n=6,title = "Population", palette = "YlGnBu" )+
-  tm_layout(frame = FALSE,legend.frame = FALSE)+
+  tm_polygons(fill = "pop_dens",
+              style = "quantile",
+              border.col = NA,
+              n = 5,
+              title = "Population",
+              palette = colors) +
+  tm_layout(frame = FALSE,
+            legend.frame = FALSE) +
   tm_title("Population of Census Tracts in Lancaster County")
 
 
@@ -184,7 +238,7 @@ Merging all the shapes. The use of `st_buffer(1)` is to add a little bit of room
 ```{r union}
 uga_union <- 
   st_union(uga) %>%
-  st_buffer(1) %>%
+  st_buffer(1) %>% # erases irregularities between lines to buffer
   st_sf()
 ```
 
@@ -285,6 +339,55 @@ buffersAndTowns <-
 # Challenge 1: Compare densities
 Can you make a table summarizing population density of tracts inside versus outside the boundary? (buffer)
 
+```{r}
+tracts17_centroid <- tracts17 %>% 
+  st_centroid() %>% 
+  mutate(is_uga = case_when(st_within(uga_union) ~ 1,
+                            TRUE ~ 0))
+
+tracts17_uga <- tracts17_centroid %>% 
+  st_within(uga_union) %>% 
+  mutate(is_uga = "Inside")
+
+tracts17_non_uga <- tracts17_centroid %>% 
+  st_difference(uga_union) %>% 
+  mutate(is_uga = "Outside")
+
+tracts_uga <- 
+  rbind(
+    st_centroid(tracts17)[uga_union,] %>%
+      st_drop_geometry() %>%
+      left_join(tracts17) %>%
+      st_sf() %>%
+      mutate(UGA = "Inside"),
+    st_centroid(tracts17)[uga_union, op = st_disjoint] %>%
+      st_drop_geometry() %>%
+      left_join(tracts17) %>%
+      st_sf() %>%
+      mutate(UGA = "Outside"))
+
+ggplot() +
+  geom_sf(data = tracts_uga,
+          aes(fill = UGA)) +
+      geom_sf(data = uga, 
+          fill = NA, 
+          color = "#d9232a40", 
+          lwd = 1.5) +
+    geom_sf(data = uga, 
+          fill = NA, 
+          color = "white",
+          alpha = 0.1,
+          linetype = "twodash", 
+          lwd = 0.25) +
+    geom_sf(data = counties,
+          fill = NA,
+          color = "#969696",
+          lty = "twodash") +
+  scale_fill_manual(name = "Urban Growth Boundary Containment",
+                    values = c("#00BFC4", "#F8766D"),
+                    labels = c("Outside", "Inside")) +
+  theme_void()
+```
 
 # Mapping Challenge 
 
